@@ -3,27 +3,26 @@ import threading
 import time
 import random
 import datetime
-import json # Para serializar e desserializar mensagens complexas
+import json
 import os
+import sys
+import traceback
 
 # --- Configurações Iniciais ---
-# Lendo variáveis de ambiente definidas no docker-compose.yml
 CLUSTER_ID = os.getenv("PEER_ID", f"Peer_{random.randint(1000, 9999)}")
-HOST = '0.0.0.0' # O contêiner sempre escuta em 0.0.0.0 para ser acessível
+HOST = '0.0.0.0'
+# time.sleep(10)
 
-# Mapeamento fixo de IDs de peers para portas.
-# IMPORTANTE: Garanta que estas portas correspondem às portas internas no seu docker-compose.yml
-PORT_MAP = {
-    "Peer_1": 12345,
-    "Peer_2": 12346,
-    "Peer_3": 12347,
-    "Peer_4": 12348,
-    "Peer_5": 12349
-}
-PORT = PORT_MAP[CLUSTER_ID] # Pega a porta específica para este PEER_ID
+try:
+    port_str = os.getenv("PEER_PORT")
+    if port_str is None:
+        raise ValueError("Variável de ambiente PEER_PORT não definida.")
+    PORT = int(port_str)
+except (ValueError, TypeError) as e:
+    print(f"[{CLUSTER_ID}] ERRO FATAL: Falha na leitura da PEER_PORT no ambiente. Detalhe: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# Lista de todos os membros do Cluster Sync (ID, HOSTNAME_DOCKER, PORT)
-# Os HOSTNAME_DOCKER são os nomes dos serviços definidos no docker-compose.yml
+# Lista de todos os membros do Cluster Sync
 CLUSTER_MEMBERS = [
     ("Peer_1", "sync_peer_1", 12345),
     ("Peer_2", "sync_peer_2", 12346),
@@ -32,54 +31,55 @@ CLUSTER_MEMBERS = [
     ("Peer_5", "sync_peer_5", 12349)
 ]
 
-# --- Estado do Peer ---
-# Bloqueio para acesso seguro aos recursos compartilhados entre threads
+# --- Estado Global do Peer ---
 lock = threading.Lock()
-
-# Fila de requisições pendentes (timestamp, client_id, requesting_peer_id)
-# O client_address_for_reply é guardado separadamente agora.
 pending_requests = []
-
-# Requisição atual que este peer está tentando processar
-# (timestamp_da_minha_req, client_id_original, meu_cluster_id)
-my_current_request = None
-
-# Número de OKs recebidos para my_current_request
+my_current_request = None 
 ok_responses_received = 0
-
-# Dicionário para armazenar o ENDEREÇO do cliente original para resposta final
-# { "CLIENT_ID": (client_host, client_port) }
-client_addresses_for_reply = {}
-
-# Adicione uma lista para armazenar peers que devem receber OKs atrasados
-deferred_oks = {} # { requesting_peer_id: [(client_timestamp, client_id)], ... }
+client_sockets_for_reply = {} 
+deferred_oks = {} 
+peer_ready = threading.Event() 
 
 # --- Funções Auxiliares ---
 
 def get_current_timestamp():
-    """Gera um timestamp no formato ISO para fácil comparação."""
     return datetime.datetime.now().isoformat()
 
-def send_message(host, port, message):
-    """Envia uma mensagem JSON para um host:port."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5) # Define um timeout para a conexão
-            s.connect((host, port))
-            s.sendall(json.dumps(message).encode('utf-8'))
-            # print(f"[{CLUSTER_ID}] Enviou: {message['type']} para {host}:{port}") # Opcional para depuração mais detalhada
-    except socket.timeout:
-        print(f"[{CLUSTER_ID}] Timeout ao conectar para {host}:{port}")
-    except ConnectionRefusedError:
-        print(f"[{CLUSTER_ID}] Erro: Conexão recusada ao enviar para {host}:{port}. O peer pode não estar pronto.")
-    except Exception as e:
-        print(f"[{CLUSTER_ID}] Erro ao enviar mensagem para {host}:{port}: {e}")
+def send_message(host, port, message, retries=3, initial_timeout=2):
+    """
+    Envia uma mensagem JSON para um host:port com tentativas de reenvio.
+    Retorna a resposta JSON (se READY_CHECK), True para sucesso (sem resposta JSON esperada), False para falha.
+    """
+    for attempt in range(retries):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(initial_timeout + attempt * 2) # Aumenta timeout a cada tentativa
+                s.connect((host, port))
+                s.sendall(json.dumps(message).encode('utf-8'))
 
-def broadcast_request_to_peers(client_id, client_timestamp, client_addr):
-    """
-    Broadcasta a requisição do cliente para todos os membros do cluster.
-    Inclui a si mesmo para processamento local.
-    """
+                if message.get("type") == "READY_CHECK":
+                    # Tenta receber a resposta ACK_READY.
+                    response_data = s.recv(4096).decode('utf-8')
+                    if not response_data:
+                        print(f"[{CLUSTER_ID}] Aviso: {host}:{port} fechou conexão sem resposta para READY_CHECK.")
+                        return False # Falha na resposta
+                    try:
+                        return json.loads(response_data) # Retorna a resposta JSON
+                    except json.JSONDecodeError:
+                        print(f"[{CLUSTER_ID}] Erro JSON na resposta de READY_CHECK de {host}:{port}: '{response_data}'")
+                        return False # Resposta não é JSON válida
+                return True # Sucesso no envio (nenhuma resposta JSON esperada ou foi processada)
+        except (socket.timeout, ConnectionRefusedError) as e:
+            print(f"[{CLUSTER_ID}] Erro ao enviar {message.get('type')} para {host}:{port} (Tentativa {attempt+1}/{retries}): {e}")
+            time.sleep(0.1 * (attempt + 1)) # Pequeno atraso antes de reintentar
+        except Exception as e:
+            print(f"[{CLUSTER_ID}] Erro inesperado ao enviar mensagem {message.get('type')} para {host}:{port} (Tentativa {attempt+1}/{retries}): {e}")
+            return False 
+    print(f"[{CLUSTER_ID}] Falha TOTAL ao enviar {message.get('type')} para {host}:{port} após {retries} tentativas.")
+    return False
+
+
+def broadcast_request_to_peers(client_id, client_timestamp):
     global my_current_request, ok_responses_received
 
     request_msg = {
@@ -90,261 +90,308 @@ def broadcast_request_to_peers(client_id, client_timestamp, client_addr):
     }
 
     with lock:
-        # Só inicializa my_current_request se não estiver processando uma
-        # Se um cliente envia múltiplas requests para o mesmo peer,
-        # este peer só pode processar uma por vez dentro do protocolo.
-        if my_current_request is None:
-            my_current_request = (client_timestamp, client_id, CLUSTER_ID)
-            # A porta para o cliente foi salva em handle_client_request, mas aqui
-            # garantimos que ela esteja mapeada para este my_current_request.
-            client_addresses_for_reply[client_id] = client_addr
-            ok_responses_received = 0 # Reinicia o contador para a nova requisição
-            print(f"[{CLUSTER_ID}] Minha requisição atual para {client_id}: {my_current_request}")
-        else:
-            # Se já estiver processando uma requisição minha, apenas ignora esta nova
-            # do mesmo cliente ou de outro. Você pode enfileirar aqui se quiser lidar
-            # com múltiplas requisições simultâneas por peer.
-            print(f"[{CLUSTER_ID}] Já estou processando uma requisição ({my_current_request}). Ignorando a nova de {client_id}.")
-            return # Sai da função para não enviar broadcasts desnecessários
+        if my_current_request is not None:
+            print(f"[{CLUSTER_ID}] Já estou processando minha requisição para {my_current_request[1]} (ts: {my_current_request[0]}). Ignorando nova de {client_id}.")
+            return
 
-    # Envia para todos os peers, incluindo ele mesmo (para processamento uniforme)
+        my_current_request = (client_timestamp, client_id, CLUSTER_ID)
+        ok_responses_received = 0 
+        print(f"[{CLUSTER_ID}] Iniciando nova requisição para {client_id} (ts: {client_timestamp})")
+
+    # IMPORTANTE: Envia para todos os peers ANTES de processar localmente
     for peer_id, peer_host, peer_port in CLUSTER_MEMBERS:
         if peer_id == CLUSTER_ID:
-            # Processa a própria requisição localmente para contar o 'OK' de si mesmo
-            with lock:
-                if my_current_request and \
-                   my_current_request[0] == client_timestamp and \
-                   my_current_request[1] == client_id: # Confirma que é a minha requisição
-                    
-                    ok_responses_received += 1
-                    print(f"[{CLUSTER_ID}] (Local) Recebeu OK de si mesmo. Total de OKs: {ok_responses_received}")
-                    if ok_responses_received >= len(CLUSTER_MEMBERS):
-                        print(f"[{CLUSTER_ID}] *** Meu turno! Entrando na SEÇÃO CRÍTICA (local) ***")
-                        execute_critical_section()
+            handle_cluster_request(request_msg) 
         else:
             send_message(peer_host, peer_port, request_msg)
+    
+    # Agora processa localmente (incluindo adicionar à fila e possivelmente dar OK a si mesmo)
+    # handle_cluster_request(request_msg)
 
-def handle_client_request(conn, addr, message): # Agora recebe 'message' (já JSON)
-    """Processa uma requisição recebida de um cliente."""
+def handle_client_request(conn, addr, message): 
     client_id = message["client_id"]
     client_timestamp = message["timestamp"]
-    print(f"[{CLUSTER_ID}] Recebeu requisição de cliente: {client_id} com timestamp {client_timestamp}")
+    print(f"[{CLUSTER_ID}] Recebeu requisição de cliente: {client_id} (ts: {client_timestamp}) de {addr}")
 
-    # Salva o ENDEREÇO do cliente para responder depois
     with lock:
-        client_addresses_for_reply[client_id] = addr
-    
-    # Inicia o processo de consenso no cluster
-    broadcast_request_to_peers(client_id, client_timestamp, addr)
-    conn.close() # Fecha a conexão de entrada do cliente AQUI, pois a resposta será por um novo socket.
+        client_sockets_for_reply[client_id] = conn 
 
+    broadcast_request_to_peers(client_id, client_timestamp) 
 
 def handle_cluster_request(message):
-    """Processa uma requisição recebida de outro membro do cluster (ou de si mesmo)."""
     global pending_requests, my_current_request, deferred_oks
 
     req_peer_id = message["requester_peer_id"]
     client_id = message["client_id"]
     client_timestamp = message["client_timestamp"]
-
+    
     with lock:
-        # Adiciona a requisição à fila de pendentes
         new_request_tuple = (client_timestamp, client_id, req_peer_id)
-        # Adiciona a requisição à fila de pendentes
-        # Evita duplicatas se o mesmo peer enviar múltiplas requests para o mesmo cliente rapidamente
-        if new_request_tuple not in pending_requests: # Evita duplicatas
+        if new_request_tuple not in pending_requests: 
             pending_requests.append(new_request_tuple)
-            pending_requests.sort() # Mantém a fila ordenada por timestamp
+            pending_requests.sort() 
 
-        print(f"[{CLUSTER_ID}] Adicionou requisição do Peer {req_peer_id} para {client_id} (ts: {client_timestamp}). Fila: {pending_requests}")
+        print(f"[{CLUSTER_ID}] Fila de requisições atualizada: {pending_requests}")
 
+        my_active_request_info = None
+        if my_current_request and my_current_request[2] == CLUSTER_ID:
+            my_active_request_info = my_current_request 
 
-        # Regra de votação:
-        # Lógica de Votação Ricart-Agrawala:
-        # Se eu não tenho uma requisição ou a recebida é mais antiga, eu voto OK.
-        # Caso contrário, eu enfileiro o OK para ser enviado depois.
-        if my_current_request is None or client_timestamp < my_current_request[0] or \
-           (client_timestamp == my_current_request[0] and req_peer_id < my_current_request[2]):
-            
-            # Se a requisição recebida é a minha, não precisamos enviar OK via rede
-            if req_peer_id == CLUSTER_ID:
-                # O 'OK' local já é contado na broadcast_request_to_peers
-                pass 
+        send_ok_immediately = False
+
+        if req_peer_id == CLUSTER_ID:
+            print(f"[{CLUSTER_ID}] Processando minha própria requisição {client_id} (ts: {client_timestamp}).")
+            return # Sai para não enviar OK para si mesmo.
+
+        if my_active_request_info is None:
+            send_ok_immediately = True
+        elif client_timestamp < my_active_request_info[0]:
+            send_ok_immediately = True
+        elif client_timestamp == my_active_request_info[0] and req_peer_id < my_active_request_info[2]:
+            send_ok_immediately = True
+        
+        if send_ok_immediately:
+            # if req_peer_id != CLUSTER_ID:
+            ok_msg = {
+                "type": "OK",
+                "responding_peer_id": CLUSTER_ID, # MANTIDO CONSISTENTE
+                "target_peer_id": req_peer_id
+            }
+            if send_message(host_of(req_peer_id), port_of(req_peer_id), ok_msg): # Usar funções auxiliares
+                print(f"[{CLUSTER_ID}] Enviou OK imediato para {req_peer_id} (req: {client_id}, ts: {client_timestamp}).")
             else:
-                ok_msg = {
-                    "type": "OK",
-                    "responding_peer_id": CLUSTER_ID,
-                    "target_peer_id": req_peer_id
-                }
-                target_host, target_port = next((p[1], p[2]) for p in CLUSTER_MEMBERS if p[0] == req_peer_id)
-                send_message(target_host, target_port, ok_msg)
-                print(f"[{CLUSTER_ID}] Enviou OK imediato para {req_peer_id} para requisição de {client_id}")
+                print(f"[{CLUSTER_ID}] FALHA ao enviar OK imediato para {req_peer_id}.")
         else:
-            # Enfileira o OK para ser enviado APÓS a seção crítica
-            if req_peer_id != CLUSTER_ID: # Não enfileira OK para si mesmo
-                if req_peer_id not in deferred_oks:
-                    deferred_oks[req_peer_id] = []
+            # if req_peer_id != CLUSTER_ID:
+            if req_peer_id not in deferred_oks:
+                deferred_oks[req_peer_id] = []
+            if (client_timestamp, client_id) not in deferred_oks[req_peer_id]:
                 deferred_oks[req_peer_id].append((client_timestamp, client_id))
-                print(f"[{CLUSTER_ID}] Enfileirou OK para {req_peer_id} para requisição de {client_id}. Meu timestamp ({my_current_request[0]}) é anterior/igual.")
+                print(f"[{CLUSTER_ID}] Enfileirou OK para {req_peer_id} (req: {client_id}, ts: {client_timestamp}). Meu ativo: {my_active_request_info[1]}, TS: {my_active_request_info[0]}.")
 
 
 def process_ok_response(responding_peer_id, target_peer_id):
-    """Processa uma resposta OK recebida de outro membro do cluster."""
     global ok_responses_received, my_current_request
 
-    # Este OK é para a minha requisição atual?
     if target_peer_id != CLUSTER_ID:
-        print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id} que não é para mim ({target_peer_id}).")
-        return 
+        print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id} mas target_peer_id é {target_peer_id} (não {CLUSTER_ID}). Ignorando.")
+        return
 
     with lock:
-        if my_current_request is not None and my_current_request[2] == CLUSTER_ID: # Confirma que é meu pedido
+        if my_current_request is not None and my_current_request[2] == CLUSTER_ID:
             ok_responses_received += 1
-            print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id}. Total de OKs: {ok_responses_received}")
+            print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id}. Total de OKs: {ok_responses_received} de {len(CLUSTER_MEMBERS)-1} necessários para minha requisição {my_current_request[1]}.")
 
-            # Se todos os OKs foram recebidos, entrar na seção crítica
-            if ok_responses_received >= len(CLUSTER_MEMBERS): # Todos os OKs (incluindo o meu local)
-                print(f"[{CLUSTER_ID}] *** TENHO TODOS OS OKs! Entrando na SEÇÃO CRÍTICA ***")
-                execute_critical_section()
+
+            if ok_responses_received == (len(CLUSTER_MEMBERS) - 1):
+                if pending_requests and pending_requests[0] == my_current_request:
+                    print(f"[{CLUSTER_ID}] *** TENHO TODOS OS OKs! Entrando na SEÇÃO CRÍTICA com requisição {my_current_request[1]} (ts: {my_current_request[0]}) ***")
+                    execute_critical_section()
+                else:
+                    print(f"[{CLUSTER_ID}] Tenho todos os OKs, mas minha requisição NÃO é a mais prioritária na fila ({my_current_request}). Fila[0]: {pending_requests[0] if pending_requests else 'Vazia'}. Aguardando minha vez.")
         else:
-            print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id} para uma requisição que não é a minha atual ou já foi processada.")
+            print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id} para uma requisição que não é a minha atual ({my_current_request}) ou já foi processada.")
 
 def execute_critical_section():
-    """
-    Lógica da seção crítica, envio de COMMITTED ao cliente original
-    e liberação do recurso, incluindo o envio de OKs atrasados.
-    """
     global my_current_request, ok_responses_received, pending_requests, deferred_oks
 
-    # Garante que há uma requisição para processar
     if my_current_request is None:
-        print(f"[{CLUSTER_ID}] Erro: Tentativa de entrar na seção crítica sem my_current_request.")
+        print(f"[{CLUSTER_ID}] Erro: Tentativa de entrar na seção crítica sem my_current_request. Isso não deveria acontecer.")
         return
 
     client_id_to_reply = my_current_request[1]
     
-    # Recupera o endereço do cliente salvo para responder
-    client_addr = None
+    client_socket = None
     with lock:
-        # Pega o endereço e remove da fila de espera por resposta, já que será respondido agora
-        if client_id_to_reply in client_addresses_for_reply:
-            client_addr = client_addresses_for_reply.pop(client_id_to_reply)
+        if client_id_to_reply in client_sockets_for_reply:
+            client_socket = client_sockets_for_reply.pop(client_id_to_reply)
 
-    if client_addr:
-        # --- SEÇÃO CRÍTICA REAL (simulada) ---
-        sleep_time = random.uniform(0.2, 1.0)
-        print(f"[{CLUSTER_ID}] Escrevendo no Recurso R por {sleep_time:.2f}s...")
+    if client_socket:
+        sleep_time = random.uniform(0.1, 1)
+        print(f"[{CLUSTER_ID}] Escrevendo no Recurso R por {sleep_time:.2f}s para {client_id_to_reply}...")
         time.sleep(sleep_time)
-        print(f"[{CLUSTER_ID}] Escrita no Recurso R concluída.")
-        # --- FIM DA SEÇÃO CRÍTICA REAL ---
+        print(f"[{CLUSTER_ID}] Escrita no Recurso R concluída para {client_id_to_reply}.")
 
-        # Envia COMMITTED para o cliente original que solicitou o acesso
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5) # Timeout para a conexão de resposta
-                s.connect(client_addr)
-                s.sendall(b"COMMITTED")
-                print(f"[{CLUSTER_ID}] Enviou COMMITTED para cliente {client_id_to_reply} em {client_addr}")
+            client_socket.sendall(b"COMMITTED")
+            print(f"[{CLUSTER_ID}] Enviou COMMITTED para cliente {client_id_to_reply} via socket original.")
         except Exception as e:
-            print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED para {client_id_to_reply} em {client_addr}: {e}")
+            print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED para {client_id_to_reply} no socket original: {e}")
+        finally:
+            client_socket.close() 
+            print(f"[{CLUSTER_ID}] Fechou socket original do cliente {client_id_to_reply}.")
     else:
-        print(f"[{CLUSTER_ID}] Aviso: Não encontrou endereço do cliente {client_id_to_reply} para responder. Ele pode ter desconectado.")
+        print(f"[{CLUSTER_ID}] Aviso: Não encontrou socket original do cliente {client_id_to_reply} para responder. Ele pode ter desconectado ou o socket foi fechado de alguma forma.")
         
-    # --- LIBERAÇÃO DA SEÇÃO CRÍTICA E ENVIO DE OKS ATRASADOS ---
     with lock:
-        # Remove a requisição que acabou de ser processada da fila de pendentes
-        # Isso é crucial para que o Ricart-Agrawala funcione, removendo a requisição
-        # que acabou de ser atendida.
+        current_req_tuple = my_current_request 
         pending_requests = [req for req in pending_requests
-                            if not (req[0] == my_current_request[0] and 
-                                    req[1] == my_current_request[1] and 
-                                    req[2] == my_current_request[2])]
+                            if not (req[0] == current_req_tuple[0] and 
+                                    req[1] == current_req_tuple[1] and 
+                                    req[2] == current_req_tuple[2])]
 
-        # Reinicia o estado deste peer para que ele possa processar uma nova requisição
         my_current_request = None
         ok_responses_received = 0
         print(f"[{CLUSTER_ID}] Seção crítica liberada. Estado resetado. Fila atual: {pending_requests}")
 
-        # Envia todos os OKs que foram enfileirados enquanto este peer estava na SC
-        # Para cada peer que tem requisições esperando meu OK
-        peers_to_clear_deferred = list(deferred_oks.keys()) # Crie uma cópia da chave para iterar
-        for peer_id_to_ok in peers_to_clear_deferred:
-            # Encontra o host e porta do peer que deve receber o OK
+        peers_with_deferred = list(deferred_oks.keys()) 
+        for peer_id_to_ok in peers_with_deferred:
             target_host, target_port = next((p[1], p[2]) for p in CLUSTER_MEMBERS if p[0] == peer_id_to_ok)
             
-            # Envia um OK para cada requisição enfileirada para este peer
-            # A mensagem OK não precisa dos detalhes da requisição, apenas o target_peer_id
             ok_msg = {
                 "type": "OK",
-                "responding_peer_id": CLUSTER_ID,
+                "responding_peer_id": CLUSTER_ID, # MANTIDO CONSISTENTE!
                 "target_peer_id": peer_id_to_ok
             }
-            send_message(target_host, target_port, ok_msg)
-            print(f"[{CLUSTER_ID}] Enviou OK atrasado para {peer_id_to_ok}.")
+            if send_message(target_host, target_port, ok_msg):
+                print(f"[{CLUSTER_ID}] Enviou OK atrasado para {peer_id_to_ok} (origem: {deferred_oks[peer_id_to_ok]}).")
+            else:
+                print(f"[{CLUSTER_ID}] FALHA ao enviar OK atrasado para {peer_id_to_ok}.")
         
-        deferred_oks.clear() # Limpa a lista de OKs enfileirados após enviá-los todos
-
+        deferred_oks.clear()
 
 
 def handle_connection(conn, addr):
-    """Lida com uma conexão de entrada (cliente ou outro peer)."""
     try:
-        data = conn.recv(4096).decode('utf-8') # Aumentado o buffer para mensagens JSON
+        conn.settimeout(5) 
+        data = conn.recv(4096).decode('utf-8')
         
-        # Tenta desserializar como JSON
+        # >>>>> Adição: Verifica se data não está vazio antes de tentar JSON <<<<<
+        if not data:
+            print(f"[{CLUSTER_ID}] Conexão de {addr} fechada ou enviou dados vazios.")
+            conn.close()
+            return
+
         message = json.loads(data)
 
-        if message.get("type") == "REQUEST": # Mensagem de um cliente
-            handle_client_request(conn, addr, message)
-        elif message.get("type") == "REQUEST_CLUSTER": # Mensagem de um peer
+        if message.get("type") == "REQUEST": 
+            peer_ready.wait(timeout=30) 
+            if not peer_ready.is_set():
+                print(f"[{CLUSTER_ID}] Aviso: Não pronto para processar requisição de cliente de {addr} (cluster não pronto em 30s). Ignorando e fechando conexão.")
+                conn.close() 
+                return
+            handle_client_request(conn, addr, message) 
+        
+        elif message.get("type") == "READY_CHECK":
+            print(f"[{CLUSTER_ID}] Recebeu READY_CHECK de {message.get('requester_peer_id')}.")
+            ack_msg = {"type": "ACK_READY", "responding_peer_id": CLUSTER_ID}
+            conn.sendall(json.dumps(ack_msg).encode('utf-8'))
+            conn.close()
+        
+        elif message.get("type") == "REQUEST_CLUSTER":
             handle_cluster_request(message)
-        elif message.get("type") == "OK": # Mensagem de OK de um peer
-            process_ok_response(message["responding_peer_id"], message["target_peer_id"])
+            conn.close() 
+        elif message.get("type") == "OK":
+            process_ok_response(message.get("responding_peer_id"), message["target_peer_id"]) 
+            conn.close() 
         else:
             print(f"[{CLUSTER_ID}] Mensagem desconhecida recebida de {addr}: {message}")
+            conn.close() 
 
     except json.JSONDecodeError:
-        print(f"[{CLUSTER_ID}] Erro de JSON: Recebeu mensagem não JSON de {addr}: {data}")
-        # Opcional: Responder com erro ao cliente se a mensagem não for JSON,
-        # mas para este cenário, um log já é suficiente.
+        print(f"[{CLUSTER_ID}] Erro de JSON: Recebeu mensagem não JSON de {addr}: '{data}'. Ignorando.")
+        conn.close() 
+    except socket.timeout:
+        print(f"[{CLUSTER_ID}] Timeout na leitura inicial da conexão de {addr}. Nenhuma mensagem recebida ou incompleta. Conexão fechada.")
+        conn.close()
     except Exception as e:
-        print(f"[{CLUSTER_ID}] Erro ao lidar com conexão de {addr}: {e}")
-    finally:
-        conn.close() # Sempre fechar a conexão de entrada
+        print(f"[{CLUSTER_ID}] Erro inesperado ao lidar com conexão de {addr}: {e}")
+        # >>>>> Importante: Imprimir o traceback para erros inesperados <<<<<
+        traceback.print_exc(file=sys.stderr)
+        conn.close()
 
+
+def handle_cluster_message(conn, message):
+    try:
+        if message.get("type") == "REQUEST_CLUSTER":
+            handle_cluster_request(message)
+        elif message.get("type") == "OK":
+            process_ok_response(message["responding_peer_id"], message["target_peer_id"])
+        elif message.get("type") == "READY_CHECK":
+            print(f"[{CLUSTER_ID}] Recebeu READY_CHECK de {message.get('requester_peer_id')}")
+            ack_msg = {
+                "type": "ACK_READY", 
+                "responding_peer_id": CLUSTER_ID,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            conn.sendall(json.dumps(ack_msg).encode('utf-8'))
+    except Exception as e:
+        print(f"[{CLUSTER_ID}] Erro ao processar mensagem do cluster: {e}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def host_of(peer_id):
+    return next((p[1] for p in CLUSTER_MEMBERS if p[0] == peer_id), None)
+
+def port_of(peer_id):
+    return next((p[2] for p in CLUSTER_MEMBERS if p[0] == peer_id), None)
+
+def check_cluster_readiness():
+    print(f"[{CLUSTER_ID}] Verificando prontidão do cluster...")
+    while True:
+        all_peers_ready = True
+        peers_not_ready = []
+        for peer_id, peer_host, peer_port in CLUSTER_MEMBERS:
+            if peer_id == CLUSTER_ID:
+                continue 
+            
+            check_msg = {"type": "READY_CHECK", "requester_peer_id": CLUSTER_ID}
+            response = send_message(peer_host, peer_port, check_msg) 
+            
+            if response and response.get("type") == "ACK_READY" and response.get("responding_peer_id") == peer_id:
+                pass
+            else:
+                peers_not_ready.append(peer_id)
+                all_peers_ready = False
+        
+        if all_peers_ready:
+            print(f"[{CLUSTER_ID}] TODOS os peers estão online e respondendo! Sinalizando prontidão.")
+            peer_ready.set() 
+            break
+        else:
+            print(f"[{CLUSTER_ID}] Peers NÃO prontos ou não respondendo ao READY_CHECK: {peers_not_ready}. Reintentando em 2 segundos...")
+        
+        time.sleep(2)
+        
 
 def start_peer_server():
-    """Inicia o servidor de escuta para este membro do Cluster Sync."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reusar o endereço imediatamente
-        s.bind((HOST, PORT))
-        s.listen()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
+        s.bind((HOST, PORT)) 
+        s.listen() 
         print(f"[{CLUSTER_ID}] Servidor escutando em {HOST}:{PORT}")
 
         while True:
             try:
-                conn, addr = s.accept()
-                print(f"[{CLUSTER_ID}] Conexão aceita de {addr}")
+                conn, addr = s.accept() 
                 thread = threading.Thread(target=handle_connection, args=(conn, addr))
-                thread.daemon = True # Permite que a thread termine com o programa principal
+                thread.daemon = True 
                 thread.start()
             except Exception as e:
-                print(f"[{CLUSTER_ID}] Erro no loop de aceitação de conexão: {e}")
+                print(f"[{CLUSTER_ID}] Erro no loop de aceitação de conexão do servidor: {e}")
 
-# --- Função Principal ---
 
 if __name__ == "__main__":
-    print(f"[{CLUSTER_ID}] Meu ID: {CLUSTER_ID}, Meu Endereço: {HOST}:{PORT}")
-    print(f"[{CLUSTER_ID}] Membros do Cluster Conhecidos: {CLUSTER_MEMBERS}")
+    try: # Este try/except é para capturar erros iniciais no bloco principal
+        print(f"[{CLUSTER_ID}] Meu ID: {CLUSTER_ID}, Meu Endereço: {HOST}:{PORT}")
+        print(f"[{CLUSTER_ID}] Membros do Cluster Conhecidos: {CLUSTER_MEMBERS}")
 
-    # Inicia o servidor em uma thread separada para permitir outras operações (como manter o programa vivo)
-    server_thread = threading.Thread(target=start_peer_server)
-    server_thread.daemon = True # Torna-a uma thread daemon
-    server_thread.start()
+        server_thread = threading.Thread(target=start_peer_server)
+        server_thread.daemon = True 
+        server_thread.start()
 
-    # Mantém a thread principal viva para que as threads daemon possam continuar rodando
-    try:
+        readiness_thread = threading.Thread(target=check_cluster_readiness)
+        readiness_thread.daemon = True
+        readiness_thread.start()
+
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print(f"[{CLUSTER_ID}] Peer encerrado.")
+        print(f"[{CLUSTER_ID}] Peer encerrado manualmente.")
+    except Exception as main_block_error:
+        print(f"[{CLUSTER_ID}] ERRO INESPERADO NO BLOCO PRINCIPAL: {main_block_error}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)

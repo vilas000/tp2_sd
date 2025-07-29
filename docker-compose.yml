@@ -1,150 +1,202 @@
-version: '3.8' # Versão do Docker Compose File Format
+version: '3.8'
 
 services:
   # --- Serviços do Cluster Sync ---
-  # Definimos 5 peers para o Cluster Sync
   sync_peer_1:
-    build: ./cluster_sync_app # Caminho para o Dockerfile do peer
-    hostname: sync_peer_1     # Nome do hostname dentro da rede Docker
+    build: ./cluster_sync_app
+    hostname: sync_peer_1
     environment:
-      # Variáveis de ambiente para o script Python
-      # Estas serão lidas no cluster_sync_peer.py para configurar o peer
       PEER_ID: Peer_1
-      # A lista de CLUSTER_MEMBERS será gerada no script do peer com base nos hostnames
-      # e portas fixas que definimos aqui.
+      PEER_PORT: 12345
+      PYTHONUNBUFFERED: 1
     ports:
-      # Mapeia a porta interna do contêiner (ex: 12345) para uma porta na sua máquina host.
-      # Isso é útil para depuração, mas não estritamente necessário para comunicação interna.
-      # Cuidado para não usar a mesma porta para múltiplos peers na máquina host.
-      - "12345:12345" # Formato: HOST_PORT:CONTAINER_PORT
+      - "12345:12345"
     networks:
-      - my_distributed_net # Conecta este serviço à rede definida abaixo
+      - my_distributed_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12345)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
 
   sync_peer_2:
     build: ./cluster_sync_app
     hostname: sync_peer_2
     environment:
       PEER_ID: Peer_2
+      PEER_PORT: 12346
+      PYTHONUNBUFFERED: 1
     ports:
       - "12346:12346"
     networks:
       - my_distributed_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12346)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      sync_peer_1:
+        condition: service_healthy
 
   sync_peer_3:
     build: ./cluster_sync_app
     hostname: sync_peer_3
     environment:
       PEER_ID: Peer_3
+      PEER_PORT: 12347
+      PYTHONUNBUFFERED: 1
     ports:
       - "12347:12347"
     networks:
       - my_distributed_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12347)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
 
   sync_peer_4:
     build: ./cluster_sync_app
     hostname: sync_peer_4
     environment:
       PEER_ID: Peer_4
+      PEER_PORT: 12348
+      PYTHONUNBUFFERED: 1
     ports:
       - "12348:12348"
     networks:
       - my_distributed_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12348)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
 
   sync_peer_5:
     build: ./cluster_sync_app
     hostname: sync_peer_5
     environment:
       PEER_ID: Peer_5
+      PEER_PORT: 12349
+      PYTHONUNBUFFERED: 1
     ports:
       - "12349:12349"
     networks:
       - my_distributed_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12349)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
+      sync_peer_4:
+        condition: service_healthy
 
   # --- Serviços do Cliente ---
-  # Definimos 5 clientes
   client_1:
-    build: ./client_app # Caminho para o Dockerfile do cliente
+    build: ./client_app
     hostname: client_1
     environment:
       CLIENT_ID: Client_A
-      # O cliente precisa se conectar a um dos peers do Cluster Sync.
-      # Usamos o hostname do serviço Docker Compose como o HOST.
-      CLUSTER_SYNC_HOST: sync_peer_1 # Conecta ao Peer_1
-      CLUSTER_SYNC_PORT: 12345      # A porta interna do contêiner do Peer_1
+      CLUSTER_SYNC_HOST: sync_peer_1
+      CLUSTER_SYNC_PORT: 12345
+      PYTHONUNBUFFERED: 1
     depends_on:
-      - sync_peer_1 # Garante que o sync_peer_1 esteja pronto antes de iniciar o cliente
-      - sync_peer_2 # Dependa de todos os peers para garantir que o cluster esteja levantado
-      - sync_peer_3
-      - sync_peer_4
-      - sync_peer_5
+      sync_peer_1:
+        condition: service_healthy
     networks:
       - my_distributed_net
+    restart: on-failure
 
   client_2:
     build: ./client_app
     hostname: client_2
     environment:
       CLIENT_ID: Client_B
-      CLUSTER_SYNC_HOST: sync_peer_2 # Conecta ao Peer_2
+      CLUSTER_SYNC_HOST: sync_peer_2
       CLUSTER_SYNC_PORT: 12346
+      PYTHONUNBUFFERED: 1
     depends_on:
-      - sync_peer_1
-      - sync_peer_2
-      - sync_peer_3
-      - sync_peer_4
-      - sync_peer_5
+      sync_peer_2:
+        condition: service_healthy
     networks:
       - my_distributed_net
+    restart: on-failure
 
   client_3:
     build: ./client_app
     hostname: client_3
     environment:
       CLIENT_ID: Client_C
-      CLUSTER_SYNC_HOST: sync_peer_3 # Conecta ao Peer_3
+      CLUSTER_SYNC_HOST: sync_peer_3
       CLUSTER_SYNC_PORT: 12347
+      PYTHONUNBUFFERED: 1
     depends_on:
-      - sync_peer_1
-      - sync_peer_2
-      - sync_peer_3
-      - sync_peer_4
-      - sync_peer_5
+      sync_peer_3:
+        condition: service_healthy
     networks:
       - my_distributed_net
+    restart: on-failure
 
   client_4:
     build: ./client_app
     hostname: client_4
     environment:
       CLIENT_ID: Client_D
-      CLUSTER_SYNC_HOST: sync_peer_4 # Conecta ao Peer_4
+      CLUSTER_SYNC_HOST: sync_peer_4
       CLUSTER_SYNC_PORT: 12348
+      PYTHONUNBUFFERED: 1
     depends_on:
-      - sync_peer_1
-      - sync_peer_2
-      - sync_peer_3
-      - sync_peer_4
-      - sync_peer_5
+      sync_peer_4:
+        condition: service_healthy
     networks:
       - my_distributed_net
+    restart: on-failure
 
   client_5:
     build: ./client_app
     hostname: client_5
     environment:
       CLIENT_ID: Client_E
-      CLUSTER_SYNC_HOST: sync_peer_5 # Conecta ao Peer_5
+      CLUSTER_SYNC_HOST: sync_peer_5
       CLUSTER_SYNC_PORT: 12349
+      PYTHONUNBUFFERED: 1
     depends_on:
-      - sync_peer_1
-      - sync_peer_2
-      - sync_peer_3
-      - sync_peer_4
-      - sync_peer_5
+      sync_peer_5:
+        condition: service_healthy
     networks:
       - my_distributed_net
+    restart: on-failure
 
-# --- Definição de Redes ---
 networks:
-  my_distributed_net: # Uma rede interna personalizada para os contêineres
-    driver: bridge # O tipo de rede padrão para comunicação entre contêineres no mesmo host
+  my_distributed_net:
+    driver: bridge

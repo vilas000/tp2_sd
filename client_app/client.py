@@ -31,8 +31,8 @@ def iniciar_cliente():
     print(f"[{CLIENT_ID}]: Aguardando {initial_delay:.2f} segundos antes de enviar requisições...")
     time.sleep(initial_delay)
 
-    # num_acessos = random.randint(10, 50)
-    num_acessos = 1
+    num_acessos = 1 
+    #num_acessos = random.randint(10, 50)  # Conforme especificação
     print(f"[{CLIENT_ID}]: Fará {num_acessos} acessos ao Recurso R.")
 
     acessos_realizados = 0
@@ -47,7 +47,7 @@ def iniciar_cliente():
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(600)  # Aumente o timeout
+                s.settimeout(30)
                 s.connect((CLUSTER_SYNC_HOST, CLUSTER_SYNC_PORT))
                 s.sendall(json.dumps(solicitacao_json).encode('utf-8'))
                 print(f"[{CLIENT_ID}]: Enviou solicitação {i+1} com timestamp {timestamp}.")
@@ -55,7 +55,7 @@ def iniciar_cliente():
                 data = s.recv(1024)
                 if not data:
                     print(f"[{CLIENT_ID}]: Conexão fechada pelo servidor.")
-                    break
+                    continue
                     
                 data = data.decode('utf-8')
                 if data == "COMMITTED":
@@ -70,16 +70,13 @@ def iniciar_cliente():
                         print(f"[{CLIENT_ID}]: Erro - Recebeu mensagem inesperada: {response_msg}")
                     except json.JSONDecodeError:
                         print(f"[{CLIENT_ID}]: Erro - Recebeu resposta inválida: '{data}'")
-                        if not data:
-                            print(f"[{CLIENT_ID}]: Servidor fechou a conexão antes de enviar COMMITTED.")
             
         except ConnectionRefusedError:
             print(f"[{CLIENT_ID}]: Erro: Conexão com o Cluster Sync recusada. Verifique se o servidor está rodando e acessível.")
             break
         except socket.timeout:
-            # >>>>> AJUSTE AQUI: Log de erro mais descritivo <<<<<
             print(f"[{CLIENT_ID}]: Erro na solicitação {i+1}: timed out. Servidor não respondeu a tempo.")
-            break
+            continue
         except Exception as e:
             print(f"[{CLIENT_ID}]: Ocorreu um erro inesperado: {e}")
             break

@@ -133,6 +133,14 @@ services:
     depends_on:
       sync_peer_1:
         condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
+      sync_peer_4:
+        condition: service_healthy
+      sync_peer_5:
+        condition: service_healthy
     networks:
       - my_distributed_net
     restart: on-failure
@@ -146,7 +154,15 @@ services:
       CLUSTER_SYNC_PORT: 12346
       PYTHONUNBUFFERED: 1
     depends_on:
+      sync_peer_1:
+        condition: service_healthy
       sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
+      sync_peer_4:
+        condition: service_healthy
+      sync_peer_5:
         condition: service_healthy
     networks:
       - my_distributed_net
@@ -161,7 +177,15 @@ services:
       CLUSTER_SYNC_PORT: 12347
       PYTHONUNBUFFERED: 1
     depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
       sync_peer_3:
+        condition: service_healthy
+      sync_peer_4:
+        condition: service_healthy
+      sync_peer_5:
         condition: service_healthy
     networks:
       - my_distributed_net
@@ -176,7 +200,15 @@ services:
       CLUSTER_SYNC_PORT: 12348
       PYTHONUNBUFFERED: 1
     depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
       sync_peer_4:
+        condition: service_healthy
+      sync_peer_5:
         condition: service_healthy
     networks:
       - my_distributed_net
@@ -191,6 +223,14 @@ services:
       CLUSTER_SYNC_PORT: 12349
       PYTHONUNBUFFERED: 1
     depends_on:
+      sync_peer_1:
+        condition: service_healthy
+      sync_peer_2:
+        condition: service_healthy
+      sync_peer_3:
+        condition: service_healthy
+      sync_peer_4:
+        condition: service_healthy
       sync_peer_5:
         condition: service_healthy
     networks:

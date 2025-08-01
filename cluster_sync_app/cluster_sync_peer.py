@@ -56,6 +56,7 @@ def broadcast_to_peers(message):
             if not send_message(peer_tuple[1], peer_tuple[2], message):
                 handle_peer_failure(peer_tuple)
 
+
 def handle_client_request(conn, addr, message):
     global pending_requests, managed_requests, client_sockets_for_reply
     client_id = message["client_id"]
@@ -66,8 +67,14 @@ def handle_client_request(conn, addr, message):
     with lock:
         request_exists = any(req[0] == timestamp and req[1] == client_id for req in pending_requests)
         if request_exists:
-            print(f"[{CLUSTER_ID}] Requisição duplicada de {client_id} ignorada.")
-            conn.close()
+            print(f"[{CLUSTER_ID}] Requisição duplicada de {client_id}. Respondendo PROCESSING.")
+            # CORREÇÃO: Envia uma resposta clara ao cliente antes de fechar a conexão.
+            try:
+                conn.sendall(b"PROCESSING")
+            except Exception as e:
+                print(f"[{CLUSTER_ID}] Erro ao enviar PROCESSING: {e}")
+            finally:
+                conn.close()
             return
         
         print(f"[{CLUSTER_ID}] Iniciando nova requisição para {client_id}.")
@@ -79,6 +86,7 @@ def handle_client_request(conn, addr, message):
     broadcast_msg = { "type": "REQUEST_CLUSTER", "requester_peer_id": CLUSTER_ID, "client_id": client_id, "client_timestamp": timestamp }
     broadcast_to_peers(broadcast_msg)
     check_if_can_enter_critical_section()
+
 
 def handle_cluster_request(message):
     global pending_requests, deferred_oks

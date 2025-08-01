@@ -122,13 +122,17 @@ services:
         condition: service_healthy
 
   # --- Serviços do Cliente ---
+
   client_1:
     build: ./client_app
     hostname: client_1
     environment:
       CLIENT_ID: Client_A
+      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_1
       CLUSTER_SYNC_PORT: 12345
+      # NOVO: Lista completa de todos os peers para failover
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
       sync_peer_1:
@@ -144,14 +148,18 @@ services:
     networks:
       - my_distributed_net
     restart: on-failure
+
 
   client_2:
     build: ./client_app
     hostname: client_2
     environment:
       CLIENT_ID: Client_B
+      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_2
       CLUSTER_SYNC_PORT: 12346
+      # NOVO: Lista completa de todos os peers para failover
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
       sync_peer_1:
@@ -167,14 +175,18 @@ services:
     networks:
       - my_distributed_net
     restart: on-failure
+
 
   client_3:
     build: ./client_app
     hostname: client_3
     environment:
-      CLIENT_ID: Client_C
+      CLIENT_ID: Client_c
+      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_3
       CLUSTER_SYNC_PORT: 12347
+      # NOVO: Lista completa de todos os peers para failover
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
       sync_peer_1:
@@ -190,14 +202,18 @@ services:
     networks:
       - my_distributed_net
     restart: on-failure
+
 
   client_4:
     build: ./client_app
     hostname: client_4
     environment:
-      CLIENT_ID: Client_D
+      CLIENT_ID: Client_d
+      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_4
       CLUSTER_SYNC_PORT: 12348
+      # NOVO: Lista completa de todos os peers para failover
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
       sync_peer_1:
@@ -214,13 +230,17 @@ services:
       - my_distributed_net
     restart: on-failure
 
+
   client_5:
     build: ./client_app
     hostname: client_5
     environment:
-      CLIENT_ID: Client_E
+      CLIENT_ID: Client_e
+      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_5
       CLUSTER_SYNC_PORT: 12349
+      # NOVO: Lista completa de todos os peers para failover
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
       sync_peer_1:

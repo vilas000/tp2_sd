@@ -1,280 +1,225 @@
+# cluster_sync_app/cluster_sync_peer.py
+
 import socket
 import threading
 import time
 import random
-#import datetime
 import json
 import os
 import sys
-#import traceback
 
-# configuracoes iniciais do peer, serao lidos das variaveis de ambiente do docker compose
+# --- Configurações ---
 CLUSTER_ID = os.getenv("PEER_ID", f"Peer_{random.randint(1000, 9999)}")
 HOST = '0.0.0.0'
-
-try:
-    port_str = os.getenv("PEER_PORT")
-    if port_str is None:
-        raise ValueError("Variável de ambiente PEER_PORT não definida.")
-    PORT = int(port_str)
-except (ValueError, TypeError) as e:
-    print(f"[{CLUSTER_ID}] ERRO FATAL: Falha na leitura da PEER_PORT. Detalhe: {e}", file=sys.stderr)
-    sys.exit(1)
-
-# lista de peers do cluster para que cada peer saiba quem sao os outros
-CLUSTER_MEMBERS = [
+PORT = int(os.getenv("PEER_PORT"))
+ALL_CLUSTER_MEMBERS = [
     ("Peer_1", "sync_peer_1", 12345), ("Peer_2", "sync_peer_2", 12346),
     ("Peer_3", "sync_peer_3", 12347), ("Peer_4", "sync_peer_4", 12348),
     ("Peer_5", "sync_peer_5", 12349)
 ]
 
-# estado global do peer, variaveis compartilhadas entre threads
-lock = threading.Lock() # garante que apenas uma thread acesse as variaveis compartilhadas por vez
-pending_requests = [] # fila de espera global, armazena tupla de todas as requisicoes pendentes no sistema
-my_current_request = None # requisicao atual do peer, se ele nao estiver na fila, sera None
-ok_responses_received = 0 # contador de respostas OK recebidas para a requisicao atual
-client_sockets_for_reply = {} # dicionario que mapeia client_id para o socket do cliente que deve receber a resposta
-deferred_oks = {} # dicionario que armazena OKs que devem ser enviados mais tarde, requisicao do proprio peer eh mais prioritaria
-peer_ready = threading.Event() # semaforo liberado quando todos os peers estao prontos, impedindo processamento de requisicoes antes do sistema estar estavel
+# --- Estado Global ---
+lock = threading.Lock()
+pending_requests = [] # Fila global de TODAS as requisições no sistema
+# CORREÇÃO: Dicionário para gerenciar o estado de cada requisição que ESTE peer é responsável
+managed_requests = {} 
+deferred_oks = {}
+client_sockets_for_reply = {}
+active_cluster_members = list(ALL_CLUSTER_MEMBERS)
+peer_ready = threading.Event()
 
+def handle_peer_failure(failed_peer_tuple):
+    global active_cluster_members
+    with lock:
+        if failed_peer_tuple in active_cluster_members:
+            active_cluster_members.remove(failed_peer_tuple)
+            print(f"[{CLUSTER_ID}] DETECTOU FALHA: Peer {failed_peer_tuple[0]} removido. Membros ativos: {len(active_cluster_members)}.")
+    check_if_can_enter_critical_section()
 
-def send_message(host, port, message, retries=5, initial_timeout=1.0):
-    '''
-    envia uma mensagem para um peer especificado por host e porta.
-    retorna True se a mensagem foi enviada com sucesso, ou False se houve falha.
-    '''
-    for attempt in range(retries):
-        try:
+def send_message(host, port, message, retries=3, initial_timeout=0.5):
+    try:
+        with socket.create_connection((host, port), timeout=initial_timeout):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(initial_timeout + attempt)
+                s.settimeout(initial_timeout)
                 s.connect((host, port))
                 s.sendall(json.dumps(message).encode('utf-8'))
                 if message.get("type") == "READY_CHECK":
-                    response_data = s.recv(1024).decode('utf-8')
-                    return json.loads(response_data) if response_data else None
+                    s.recv(1024)
                 return True
-        except (OSError, socket.timeout) as e:
-            if attempt >= retries - 1: return False
-            time.sleep(0.5 * (attempt + 1))
-        except Exception: return False
-    return False
+    except (OSError, socket.timeout):
+        return False
 
 def broadcast_to_peers(message):
-    '''
-    envia uma mensagem para todos os peers do cluster, exceto o próprio peer.
-    '''
-    for peer_id, peer_host, peer_port in CLUSTER_MEMBERS:
-        if peer_id != CLUSTER_ID:
-            send_message(peer_host, peer_port, message)
-
-
-def broadcast_request_to_peers(client_id, client_timestamp):
-    '''
-    define a requisicao atual, adiciona na propria fila de espera.
-    envia uma mensagem de requisicao REQUEST_CLUSTER para todos os outros peers.
-    '''
-    global my_current_request, ok_responses_received
-    with lock:
-        my_current_request = (client_timestamp, client_id, CLUSTER_ID)
-        ok_responses_received = 0
-        pending_requests.append(my_current_request)
-        pending_requests.sort()
-        print(f"[{CLUSTER_ID}] Iniciando nova requisição para {client_id}. Fila: {pending_requests}")
-
-    request_msg = { "type": "REQUEST_CLUSTER", "requester_peer_id": CLUSTER_ID,
-                    "client_id": client_id, "client_timestamp": client_timestamp }
-    broadcast_to_peers(request_msg)
-    process_ok_response(CLUSTER_ID, CLUSTER_ID)
-
+    with lock: current_active_peers = list(active_cluster_members)
+    for peer_tuple in current_active_peers:
+        if peer_tuple[0] != CLUSTER_ID:
+            if not send_message(peer_tuple[1], peer_tuple[2], message):
+                handle_peer_failure(peer_tuple)
 
 def handle_client_request(conn, addr, message):
-    '''
-    funcao chamada quando cliente envia requisicao.
-    guarda o socket do cliente para enviar resposta depois
-    chama broadcast_request_to_peers para iniciar processo de votacao
-    '''
-    with lock:
-        client_sockets_for_reply[message["client_id"]] = conn
-    broadcast_request_to_peers(message["client_id"], message["timestamp"])
+    global pending_requests, managed_requests, client_sockets_for_reply
+    client_id = message["client_id"]
+    timestamp = message["timestamp"]
+    req_tuple = (timestamp, client_id, CLUSTER_ID)
+    req_key = (timestamp, client_id)
 
+    with lock:
+        request_exists = any(req[0] == timestamp and req[1] == client_id for req in pending_requests)
+        if request_exists:
+            print(f"[{CLUSTER_ID}] Requisição duplicada de {client_id} ignorada.")
+            conn.close()
+            return
+        
+        print(f"[{CLUSTER_ID}] Iniciando nova requisição para {client_id}.")
+        pending_requests.append(req_tuple)
+        pending_requests.sort()
+        managed_requests[req_key] = {"ok_count": 1, "status": "pending"}
+        client_sockets_for_reply[req_key] = conn
+    
+    broadcast_msg = { "type": "REQUEST_CLUSTER", "requester_peer_id": CLUSTER_ID, "client_id": client_id, "client_timestamp": timestamp }
+    broadcast_to_peers(broadcast_msg)
+    check_if_can_enter_critical_section()
 
 def handle_cluster_request(message):
-    '''
-    funcao executada quando outro peer envia uma requisicao REQUEST_CLUSTER
-    adiciona a requisicao a sua fila local pending_requests e reordena a fila
-    compara o timestamp da requisicao recebida com o timestamp da requisicao atual do peer
-    se ele nao tem requisicao atual ou se o pedido recebido eh mais antigo, envia OK para o peer que fez a requisicao
-    se nao, adia a resposta e adiciona o peer solicitante ao dicionario deferred_oks
-    '''
-    global deferred_oks
+    global pending_requests, deferred_oks
     req_peer_id = message["requester_peer_id"]
-    new_request_tuple = (message["client_timestamp"], message["client_id"], req_peer_id)
+    client_id = message["client_id"]
+    timestamp = message["client_timestamp"]
+    new_request_tuple = (timestamp, client_id, req_peer_id)
+
     with lock:
         if new_request_tuple not in pending_requests:
             pending_requests.append(new_request_tuple)
             pending_requests.sort()
-        my_req_info = my_current_request
-        send_ok = (my_req_info is None) or (new_request_tuple < my_req_info)
-        if send_ok:
-            target_host, target_port = next(((p[1], p[2]) for p in CLUSTER_MEMBERS if p[0] == req_peer_id), (None, None))
-            if target_host:
-                ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": req_peer_id}
-                send_message(target_host, target_port, ok_msg)
+        
+        my_managed_requests = [key for key, val in managed_requests.items() if val.get("status") == "pending"]
+        should_defer = False
+        for my_req_key in my_managed_requests:
+            my_req_tuple = (my_req_key[0], my_req_key[1], CLUSTER_ID)
+            if my_req_tuple < new_request_tuple:
+                should_defer = True
+                break
+        
+        if not should_defer:
+            target_tuple = next((p for p in ALL_CLUSTER_MEMBERS if p[0] == req_peer_id), None)
+            if target_tuple:
+                ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": req_peer_id, "request_ts": timestamp, "request_client_id": client_id}
+                if not send_message(target_tuple[1], target_tuple[2], ok_msg):
+                    handle_peer_failure(target_tuple)
         else:
-            deferred_oks[req_peer_id] = True
+            deferred_oks[new_request_tuple] = True
 
-
-def process_ok_response(responding_peer_id, target_peer_id):
-    '''
-    funcao chamada no peer original toda vez que recebe uma resposta OK de outro peer
-    incrementa o ok_responses_received e quando chega ao numero de peers do cluster faz a verificacao final
-    se a requisicao atual eh a primeira da fila, chama execute_critical_section
-    '''
-    global ok_responses_received
-    if target_peer_id != CLUSTER_ID: return
+def process_ok_response(message):
+    global managed_requests
+    req_key = (message["request_ts"], message["request_client_id"])
+    
     with lock:
-        if my_current_request is None: return
-        ok_responses_received += 1
-        print(f"[{CLUSTER_ID}] Recebeu OK de {responding_peer_id}. Total: {ok_responses_received}/{len(CLUSTER_MEMBERS)}.")
-        if ok_responses_received == len(CLUSTER_MEMBERS) and pending_requests[0] == my_current_request:
-            execute_critical_section()
+        if req_key in managed_requests:
+            managed_requests[req_key]["ok_count"] += 1
+            num_active = len(active_cluster_members)
+            print(f"[{CLUSTER_ID}] Recebeu OK de {message['responding_peer_id']} para {req_key[1]}. Total: {managed_requests[req_key]['ok_count']}/{num_active}.")
+    check_if_can_enter_critical_section()
 
-
-def handle_release_message(message):
-    '''
-    funcao executada em todos os peers quando recebem a mensagem RELEASE de outro peer que liberou o recurso
-    simplesmente remove a requisicao finalizada da sua fila de pending_requests
-    apos remover o item, ela checa se por acaso agora eh a sua vez de entrar na secao critica (caso ja tenha os 5 ok)
-    '''
-    global pending_requests
+def check_if_can_enter_critical_section():
+    global managed_requests
     with lock:
-        request_to_remove = (message["client_timestamp"], message["client_id"], message["releasing_peer_id"])
-        if request_to_remove in pending_requests:
-            pending_requests.remove(request_to_remove)
-            print(f"[{CLUSTER_ID}] Recebeu RELEASE de {message['releasing_peer_id']}. Fila atual: {pending_requests}")
-        # Após remover um item, verifica se agora é minha vez
-        if my_current_request and ok_responses_received == len(CLUSTER_MEMBERS) and pending_requests and pending_requests[0] == my_current_request:
-            execute_critical_section()
+        if not pending_requests: return
+        head_of_queue = pending_requests[0]
+        req_key = (head_of_queue[0], head_of_queue[1])
+        
+        if head_of_queue[2] == CLUSTER_ID: # Se este peer é o responsável pela requisição na cabeça da fila
+            if req_key in managed_requests and managed_requests[req_key]["status"] == "pending":
+                num_active = len(active_cluster_members)
+                if managed_requests[req_key]["ok_count"] >= num_active:
+                    managed_requests[req_key]["status"] = "in_cs"
+                    threading.Thread(target=execute_critical_section, args=(head_of_queue,)).start()
 
+def execute_critical_section(req_tuple):
+    global pending_requests, client_sockets_for_reply, managed_requests, deferred_oks
+    req_key = (req_tuple[0], req_tuple[1])
+    
+    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA INICIADA para {req_key[1]} ***")
+    time.sleep(random.uniform(0.2, 1))
 
-def execute_critical_section():
-    '''
-    funcao chamada quando um peer ganha o direito de acesso ao recurso compartilhado
-    '''
-    global pending_requests, my_current_request, ok_responses_received, deferred_oks
-
-
-    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA INICIADA para {my_current_request[1]} ***")
-    
-    # prepara dados para I/O antes de modificar o estado
-    req_tuple = my_current_request
-    client_socket = client_sockets_for_reply.pop(req_tuple[1], None)
-    
-    # modifica o estado atomicamente com lock
-    # remove sua requisicao da fila de espera, limpa variaveis de estado e pega lista de oks adiados para enviar depois
-    pending_requests.pop(0)
-    my_current_request = None
-    ok_responses_received = 0
-    peers_to_send_ok = list(deferred_oks.keys())
-    deferred_oks.clear()
-    
-    # simula o trabalho na secao critica
-    sleep_time = random.uniform(0.2, 1)
-    print(f"[{CLUSTER_ID}] ...Trabalhando por {sleep_time:.2f}s...")
-    time.sleep(sleep_time)
-    
-    # envia COMMITTED para o cliente que fez a requisicao
+    client_socket = client_sockets_for_reply.pop(req_key, None)
     if client_socket:
         try:
             client_socket.sendall(b"COMMITTED")
-            print(f"[{CLUSTER_ID}] Enviou COMMITTED para {req_tuple[1]}.")
+            print(f"[{CLUSTER_ID}] Enviou COMMITTED para {req_key[1]}.")
         except Exception as e: print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED: {e}")
         finally: client_socket.close()
 
     print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA LIBERADA ***")
-
-    # transmite uma mensagem RELEASE para todos os peers, sinalizando que terminou e o recurso esta livre para uso
-    release_msg = { "type": "RELEASE", "releasing_peer_id": CLUSTER_ID,
-                    "client_id": req_tuple[1], "client_timestamp": req_tuple[0] }
+    
+    release_msg = {"type": "RELEASE", "releasing_peer_id": CLUSTER_ID, "client_id": req_key[1], "client_timestamp": req_key[0]}
     broadcast_to_peers(release_msg)
+    
+    with lock:
+        if req_tuple in pending_requests: pending_requests.remove(req_tuple)
+        managed_requests.pop(req_key, None)
+        
+        oks_to_send_now = []
+        remaining_deferred = {}
+        for deferred_req, _ in deferred_oks.items():
+            oks_to_send_now.append(deferred_req)
+        deferred_oks = remaining_deferred
+    
+    for deferred_req_tuple in oks_to_send_now:
+        ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": deferred_req_tuple[2], "request_ts": deferred_req_tuple[0], "request_client_id": deferred_req_tuple[1]}
+        target_info = next((p for p in ALL_CLUSTER_MEMBERS if p[0] == deferred_req_tuple[2]), None)
+        if target_info:
+            if not send_message(target_info[1], target_info[2], ok_msg):
+                handle_peer_failure(target_info)
+    
+    check_if_can_enter_critical_section()
 
-    # envia as mensagens OK que estavam na sua lista deferred_oks
-    for peer_id in peers_to_send_ok:
-        target_host, target_port = next(((p[1], p[2]) for p in CLUSTER_MEMBERS if p[0] == peer_id), (None, None))
-        if target_host:
-            ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": peer_id}
-            send_message(target_host, target_port, ok_msg)
-
+def handle_release_message(message):
+    global pending_requests
+    request_to_remove = (message["client_timestamp"], message["client_id"], message["releasing_peer_id"])
+    with lock:
+        if request_to_remove in pending_requests:
+            pending_requests.remove(request_to_remove)
+    check_if_can_enter_critical_section()
 
 def handle_connection(conn, addr):
-    '''
-    lida com conexoes de clientes ou outros peers.
-    le a mensagem recebuida, decodifica e olha o campo type no JSON.
-    Com base no tipo, chama a funcao apropriada para processar a mensagem.
-    '''
     try:
-        data = conn.recv(1024).decode('utf-8')
+        data = conn.recv(1024);
         if not data: conn.close(); return
-        message = json.loads(data)
+        message = json.loads(data.decode('utf-8'))
         msg_type = message.get("type")
 
-        if msg_type == "REQUEST":
-            peer_ready.wait()
-            handle_client_request(conn, addr, message)
+        if msg_type == "REQUEST": peer_ready.wait(); handle_client_request(conn, addr, message)
         else:
             if msg_type == "REQUEST_CLUSTER": handle_cluster_request(message)
-            elif msg_type == "OK": process_ok_response(message.get("responding_peer_id"), message["target_peer_id"])
-            elif msg_type == "RELEASE": handle_release_message(message) # <-- ADICIONADO
-            elif msg_type == "READY_CHECK":
-                conn.sendall(json.dumps({"type": "ACK_READY"}).encode('utf-8'))
+            elif msg_type == "OK": process_ok_response(message)
+            elif msg_type == "RELEASE": handle_release_message(message)
+            elif msg_type == "READY_CHECK": conn.sendall(b"ACK_READY")
             conn.close()
     except Exception: conn.close()
 
-
 def check_cluster_readiness():
-    '''
-    verifica se todos os peers do cluster estao prontos para processar requisicoes.
-    '''
     print(f"[{CLUSTER_ID}] Verificando prontidão do cluster...")
     ready_peers = {CLUSTER_ID}
-    while len(ready_peers) < len(CLUSTER_MEMBERS):
-        for peer_id, peer_host, peer_port in CLUSTER_MEMBERS:
-            if peer_id in ready_peers: continue
-            if send_message(peer_host, peer_port, {"type": "READY_CHECK"}):
+    while len(ready_peers) < len(ALL_CLUSTER_MEMBERS):
+        for peer_id, peer_host, peer_port in ALL_CLUSTER_MEMBERS:
+            if peer_id not in ready_peers and send_message(peer_host, peer_port, {"type": "READY_CHECK"}):
                 ready_peers.add(peer_id)
-                print(f"[{CLUSTER_ID}] Peer {peer_id} está pronto. ({len(ready_peers)}/{len(CLUSTER_MEMBERS)})")
-        if len(ready_peers) < len(CLUSTER_MEMBERS): time.sleep(1)
-    print(f"[{CLUSTER_ID}] TODOS os peers estão online!")
-    peer_ready.set()
-
+                print(f"[{CLUSTER_ID}] Peer {peer_id} está pronto. ({len(ready_peers)}/{len(ALL_CLUSTER_MEMBERS)})")
+        time.sleep(1)
+    print(f"[{CLUSTER_ID}] TODOS os peers estão online!"); peer_ready.set()
 
 def start_peer_server():
-    '''
-    loop infinito que aceita conexoes de rede, para cada nova conexao ele cria uma thread 
-    para executar handle_connection.
-    Assim, o servidor atende multiplas conexoes simultaneamente.
-    '''
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PORT))
-        s.listen()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((HOST, PORT)); s.listen()
         print(f"[{CLUSTER_ID}] Servidor escutando em {HOST}:{PORT}")
         while True:
             conn, addr = s.accept()
             threading.Thread(target=handle_connection, args=(conn, addr), daemon=True).start()
 
-
-
 if __name__ == "__main__":
-    print(f"[{CLUSTER_ID}] Peer iniciando... Meu ID: {CLUSTER_ID}, Endereço: {HOST}:{PORT}")
-    # duas threads: uma inicia o servidor TCP qe fica escutando para sempre por conexoes de clientes ou outros peers
-    # outra executa a verificacao que garante que todos os nós estao de pe, permitindo que o sistema comece a processar requisições
     server_thread = threading.Thread(target=start_peer_server, daemon=True)
     readiness_thread = threading.Thread(target=check_cluster_readiness, daemon=True)
-    server_thread.start()
-    readiness_thread.start()
+    server_thread.start(); readiness_thread.start()
     try:
-        readiness_thread.join()
-        print(f"[{CLUSTER_ID}] Cluster pronto. Peer operacional.")
-        server_thread.join()
+        readiness_thread.join(); print(f"[{CLUSTER_ID}] Cluster pronto. Peer operacional."); server_thread.join()
     except KeyboardInterrupt: print(f"\n[{CLUSTER_ID}] Encerrando.")

@@ -1,25 +1,26 @@
-version: '3.8'
+version: '3.8' 
 
 services:
   # --- Serviços do Cluster Sync ---
   sync_peer_1:
-    build: ./cluster_sync_app
-    hostname: sync_peer_1
-    environment:
-      PEER_ID: Peer_1
-      PEER_PORT: 12345
-      PYTHONUNBUFFERED: 1
+    build: ./cluster_sync_app # Usando a imagem do Cluster Sync
+    hostname: sync_peer_1 # Nome do host para o primeiro peer
+    environment: 
+      PEER_ID: Peer_1 # ID do peer
+      PEER_PORT: 12345 # Porta do peer
+      PYTHONUNBUFFERED: 1 # Variável de ambiente para garantir que a saída do Python seja exibida em tempo real
+
     ports:
-      - "12345:12345"
+      - "12345:12345" # Mapeando a porta do peer para a porta do host
     networks:
-      - my_distributed_net
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12345)); s.close()"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 20s
+      - my_distributed_net # Conectando ao network bridge
+    restart: unless-stopped # Reiniciar o serviço a menos que seja parado manualmente
+    healthcheck: # Teste de saúde para garantir que o serviço esteja funcionando corretamente
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 12345)); s.close()"] # Teste de saúde usando um comando Python para verificar a conectividade
+      interval: 5s # Intervalo entre os testes de saúde
+      timeout: 3s # Tempo limite para o teste de saúde
+      retries: 5 # Número de tentativas antes de considerar o serviço como não saudável
+      start_period: 20s # Período de espera antes de iniciar o teste de saúde
 
   sync_peer_2:
     build: ./cluster_sync_app
@@ -124,17 +125,15 @@ services:
   # --- Serviços do Cliente ---
 
   client_1:
-    build: ./client_app
-    hostname: client_1
+    build: ./client_app # Usando a imagem do Cliente
+    hostname: client_1 # Nome do host para o primeiro cliente
     environment:
-      CLIENT_ID: Client_A
-      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
-      CLUSTER_SYNC_HOST: sync_peer_1
-      CLUSTER_SYNC_PORT: 12345
-      # NOVO: Lista completa de todos os peers para failover
-      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
-      PYTHONUNBUFFERED: 1
-    depends_on:
+      CLIENT_ID: Client_A # ID do cliente
+      CLUSTER_SYNC_HOST: sync_peer_1 # Host do peer de sincronização inicial
+      CLUSTER_SYNC_PORT: 12345 # Porta do peer de sincronização inicial
+      CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349" # Lista completa de todos os peers para failover
+      PYTHONUNBUFFERED: 1 # Variável de ambiente para garantir que a saída do Python seja exibida em tempo real
+    depends_on: # Dependências para garantir que os peers estejam saudáveis antes de iniciar o cliente, verifica se todos os peers estão saudáveis
       sync_peer_1:
         condition: service_healthy
       sync_peer_2:
@@ -146,8 +145,8 @@ services:
       sync_peer_5:
         condition: service_healthy
     networks:
-      - my_distributed_net
-    restart: on-failure
+      - my_distributed_net # Conectando ao network bridge
+    restart: on-failure # Reiniciar o serviço em caso de falha
 
 
   client_2:
@@ -155,10 +154,8 @@ services:
     hostname: client_2
     environment:
       CLIENT_ID: Client_B
-      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_2
       CLUSTER_SYNC_PORT: 12346
-      # NOVO: Lista completa de todos os peers para failover
       CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
@@ -182,10 +179,8 @@ services:
     hostname: client_3
     environment:
       CLIENT_ID: Client_c
-      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_3
       CLUSTER_SYNC_PORT: 12347
-      # NOVO: Lista completa de todos os peers para failover
       CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
@@ -209,10 +204,8 @@ services:
     hostname: client_4
     environment:
       CLIENT_ID: Client_d
-      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_4
       CLUSTER_SYNC_PORT: 12348
-      # NOVO: Lista completa de todos os peers para failover
       CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
@@ -236,10 +229,8 @@ services:
     hostname: client_5
     environment:
       CLIENT_ID: Client_e
-      # AINDA PRECISAMOS DO HOST/PORT INICIAL PARA A PRIMEIRA CONEXÃO
       CLUSTER_SYNC_HOST: sync_peer_5
       CLUSTER_SYNC_PORT: 12349
-      # NOVO: Lista completa de todos os peers para failover
       CLUSTER_PEERS_LIST: "sync_peer_1:12345,sync_peer_2:12346,sync_peer_3:12347,sync_peer_4:12348,sync_peer_5:12349"
       PYTHONUNBUFFERED: 1
     depends_on:
@@ -257,6 +248,6 @@ services:
       - my_distributed_net
     restart: on-failure
 
-networks:
-  my_distributed_net:
-    driver: bridge
+networks: # Definindo a rede bridge personalizada
+  my_distributed_net: #
+    driver: bridge # Usando o driver bridge para criar uma rede personalizada

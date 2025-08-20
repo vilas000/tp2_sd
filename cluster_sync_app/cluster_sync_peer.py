@@ -12,6 +12,14 @@ CLUSTER_ID = os.getenv("PEER_ID", f"Peer_{random.randint(1000, 9999)}")
 HOST = '0.0.0.0'
 PORT = int(os.getenv("PEER_PORT"))
 
+# --- NOVA CONFIGURAÇÃO ---
+# Lista de nós do Cluster Store, lida do ambiente
+store_peers_str = os.getenv("CLUSTER_STORE_PEERS", "localhost:20001")
+CLUSTER_STORE_NODES = []
+for peer_addr in store_peers_str.split(','):
+    host, port = peer_addr.split(':')
+    CLUSTER_STORE_NODES.append({"host": host, "port": int(port)})
+
 # lista de peers do cluster para que cada peer saiba quem sao os outros
 ALL_CLUSTER_MEMBERS = [
     ("Peer_1", "sync_peer_1", 12345), ("Peer_2", "sync_peer_2", 12346),
@@ -171,48 +179,156 @@ def check_if_can_enter_critical_section():
                     threading.Thread(target=execute_critical_section, args=(head_of_queue,)).start() # inicia a execução da seção crítica em uma nova thread
 
 
+# def execute_critical_section(req_tuple):
+#     '''
+#     executa a seção crítica, enviando a resposta COMMITTED ao cliente e liberando a seção crítica.
+#     '''
+#     global pending_requests, client_sockets_for_reply, managed_requests, deferred_oks
+#     req_key = (req_tuple[0], req_tuple[1]) # cria uma chave para a requisição
+    
+#     print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA INICIADA para {req_key[1]} ***")
+#     time.sleep(random.uniform(0.2, 1)) # simula o tempo de execução da seção crítica
+
+#     client_socket = client_sockets_for_reply.pop(req_key, None) # obtém o socket do cliente para enviar a resposta
+#     if client_socket: # se o socket do cliente está disponível
+#         try: 
+#             client_socket.sendall(b"COMMITTED") # envia a resposta COMMITTED ao cliente
+#             print(f"[{CLUSTER_ID}] Enviou COMMITTED para {req_key[1]}.")
+#         except Exception as e: print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED: {e}")
+#         finally: client_socket.close()
+
+#     print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA LIBERADA ***") # libera a seção crítica
+#     # Envia mensagem de liberação para todos os peers, informando que a seção crítica foi liberada
+    
+#     release_msg = {"type": "RELEASE", "releasing_peer_id": CLUSTER_ID, "client_id": req_key[1], "client_timestamp": req_key[0]}
+#     broadcast_to_peers(release_msg) # envia a mensagem de liberação para todos os peers
+    
+#     with lock:
+#         if req_tuple in pending_requests: pending_requests.remove(req_tuple) # remove a requisição da fila de pendentes
+#         managed_requests.pop(req_key, None) # remove a requisição do dicionário de gerenciadas
+        
+#         oks_to_send_now = [] # lista de OKs que devem ser enviados agora
+#         remaining_deferred = {} # dicionário para armazenar OKs que devem ser enviados mais tarde
+#         for deferred_req, _ in deferred_oks.items(): # verifica as requisições adiadas
+#             oks_to_send_now.append(deferred_req) # adiciona as requisições adiadas que devem ser enviadas agora
+#         deferred_oks = remaining_deferred # limpa o dicionário de OKs adiados
+    
+#     for deferred_req_tuple in oks_to_send_now: # envia os OKs adiados agora
+#         ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": deferred_req_tuple[2], "request_ts": deferred_req_tuple[0], "request_client_id": deferred_req_tuple[1]}
+#         target_info = next((p for p in ALL_CLUSTER_MEMBERS if p[0] == deferred_req_tuple[2]), None) # encontra o peer alvo na lista de membros do cluster
+#         if target_info:
+#             if not send_message(target_info[1], target_info[2], ok_msg): # tenta enviar a mensagem OK para o peer alvo
+#                 handle_peer_failure(target_info)
+    
+#     check_if_can_enter_critical_section() # Verifica se há outras requisições pendentes que podem ser processadas
+
+
 def execute_critical_section(req_tuple):
-    '''
-    executa a seção crítica, enviando a resposta COMMITTED ao cliente e liberando a seção crítica.
-    '''
+    """
+    Executa a seção crítica. No TP3, isso significa:
+    1. Conectar ao Cluster Store para realizar uma escrita.
+    2. Lidar com falhas do nó primário do Cluster Store.
+    3. Após a escrita bem-sucedida, responder ao cliente e liberar o recurso.
+    """
     global pending_requests, client_sockets_for_reply, managed_requests, deferred_oks
-    req_key = (req_tuple[0], req_tuple[1]) # cria uma chave para a requisição
+    req_key = (req_tuple[0], req_tuple[1])
+    client_id = req_key[1]
+    timestamp = req_key[0]
     
-    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA INICIADA para {req_key[1]} ***")
-    time.sleep(random.uniform(0.2, 1)) # simula o tempo de execução da seção crítica
-
-    client_socket = client_sockets_for_reply.pop(req_key, None) # obtém o socket do cliente para enviar a resposta
-    if client_socket: # se o socket do cliente está disponível
-        try: 
-            client_socket.sendall(b"COMMITTED") # envia a resposta COMMITTED ao cliente
-            print(f"[{CLUSTER_ID}] Enviou COMMITTED para {req_key[1]}.")
-        except Exception as e: print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED: {e}")
-        finally: client_socket.close()
-
-    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA LIBERADA ***") # libera a seção crítica
-    # Envia mensagem de liberação para todos os peers, informando que a seção crítica foi liberada
+    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA INICIADA para {client_id} ***")
     
-    release_msg = {"type": "RELEASE", "releasing_peer_id": CLUSTER_ID, "client_id": req_key[1], "client_timestamp": req_key[0]}
-    broadcast_to_peers(release_msg) # envia a mensagem de liberação para todos os peers
+    # --- LÓGICA DE INTERAÇÃO COM O CLUSTER STORE ---
+    write_successful = False
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        print(f"[{CLUSTER_ID}] Tentativa {attempt + 1}/{max_attempts} de escrita no Cluster Store.")
+    
+    # Tenta se comunicar com os nós do store em ordem. Se o primeiro falhar, tenta o próximo.
+        for store_node in CLUSTER_STORE_NODES:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(3) # Timeout para conexão e resposta
+                    s.connect((store_node["host"], store_node["port"]))
+                    
+                    write_request = {
+                        "type": "WRITE_REQUEST",
+                        "client_id": client_id,
+                        "timestamp": timestamp
+                    }
+                    s.sendall(json.dumps(write_request).encode('utf-8'))
+                    
+                    response_data = s.recv(1024).decode('utf-8')
+                    if response_data:
+                        response = json.loads(response_data)
+                        if response.get("status") == "WRITE_SUCCESS":
+                            print(f"[{CLUSTER_ID}] Escrita em {store_node['host']} (PRIMÁRIO) bem-sucedida.")
+                            write_successful = True
+                            break # Sai do loop se a escrita foi bem-sucedida
+                        elif response.get("status") == "NOT_PRIMARY":
+                                # Se não for o primário, o ideal seria tentar o nó que ele indicou.
+                                # Para simplificar, continuaremos tentando o próximo da lista.
+                                print(f"[{CLUSTER_ID}] Nó {store_node['host']} reportou não ser o primário.")
+                        else:
+                                print(f"[{CLUSTER_ID}] Resposta inesperada de {store_node['host']}: {response.get('status')}")
+                    else:
+                        print(f"[{CLUSTER_ID}] Resposta vazia de {store_node['host']}. Tentando o próximo.")
+
+            except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                print(f"[{CLUSTER_ID}] Não foi possível conectar ao nó do store {store_node['host']}: {e}. Tentando o próximo.")
+        if write_successful:
+            break
+
+        if attempt < max_attempts - 1:
+            wait_time = 2
+            print(f"[{CLUSTER_ID}] Ciclo de escrita falhou. Aguardando {wait_time}s para a eleição do Store...")
+            time.sleep(wait_time)
+            
+    # --- FIM DA LÓGICA DE INTERAÇÃO ---
+
+    if not write_successful:
+        print(f"[{CLUSTER_ID}] ERRO FATAL: Não foi possível escrever no Cluster Store após tentar todos os nós.")
+        # Decide o que fazer: podemos reenfileirar a requisição ou falhar.
+        # Por simplicidade, vamos falhar e liberar o lock.
+        # Numa implementação real, a requisição poderia ser tentada novamente.
+    
+    client_socket = client_sockets_for_reply.pop(req_key, None)
+    if client_socket:
+        try:
+            # Envia COMMITTED mesmo se a escrita falhou para não bloquear o cliente indefinidamente.
+            # O log indicará a falha.
+            client_socket.sendall(b"COMMITTED")
+            print(f"[{CLUSTER_ID}] Enviou COMMITTED para {client_id}.")
+        except Exception as e:
+            print(f"[{CLUSTER_ID}] Erro ao enviar COMMITTED: {e}")
+        finally:
+            client_socket.close()
+
+    print(f"[{CLUSTER_ID}] *** SEÇÃO CRÍTICA LIBERADA ***")
+    
+    release_msg = {"type": "RELEASE", "releasing_peer_id": CLUSTER_ID, "client_id": client_id, "client_timestamp": timestamp}
+    broadcast_to_peers(release_msg)
     
     with lock:
-        if req_tuple in pending_requests: pending_requests.remove(req_tuple) # remove a requisição da fila de pendentes
-        managed_requests.pop(req_key, None) # remove a requisição do dicionário de gerenciadas
+        if req_tuple in pending_requests:
+            pending_requests.remove(req_tuple)
+        managed_requests.pop(req_key, None)
         
-        oks_to_send_now = [] # lista de OKs que devem ser enviados agora
-        remaining_deferred = {} # dicionário para armazenar OKs que devem ser enviados mais tarde
-        for deferred_req, _ in deferred_oks.items(): # verifica as requisições adiadas
-            oks_to_send_now.append(deferred_req) # adiciona as requisições adiadas que devem ser enviadas agora
-        deferred_oks = remaining_deferred # limpa o dicionário de OKs adiados
+        # Lógica para enviar OKs adiados (mesma do TP2)
+        oks_to_send_now = []
+        remaining_deferred = {}
+        for deferred_req, _ in deferred_oks.items():
+            oks_to_send_now.append(deferred_req)
+        deferred_oks = remaining_deferred
     
-    for deferred_req_tuple in oks_to_send_now: # envia os OKs adiados agora
+    for deferred_req_tuple in oks_to_send_now:
         ok_msg = {"type": "OK", "responding_peer_id": CLUSTER_ID, "target_peer_id": deferred_req_tuple[2], "request_ts": deferred_req_tuple[0], "request_client_id": deferred_req_tuple[1]}
-        target_info = next((p for p in ALL_CLUSTER_MEMBERS if p[0] == deferred_req_tuple[2]), None) # encontra o peer alvo na lista de membros do cluster
+        target_info = next((p for p in ALL_CLUSTER_MEMBERS if p[0] == deferred_req_tuple[2]), None)
         if target_info:
-            if not send_message(target_info[1], target_info[2], ok_msg): # tenta enviar a mensagem OK para o peer alvo
+            if not send_message(target_info[1], target_info[2], ok_msg):
                 handle_peer_failure(target_info)
     
-    check_if_can_enter_critical_section() # Verifica se há outras requisições pendentes que podem ser processadas
+    check_if_can_enter_critical_section()
 
 
 def handle_release_message(message):

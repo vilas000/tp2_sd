@@ -1,6 +1,80 @@
 version: '3.8' 
 
 services:
+  # --- Serviços do Cluster Store (NOVOS) ---
+  store_node_1:
+    build: ./cluster_store_app
+    hostname: store_node_1
+    networks:
+      - my_distributed_net
+    ports:
+      - "20001:20001"
+    environment:
+      NODE_ID: Store_1
+      NODE_PORT: 20001
+      PRIMARY_NODE_ID: Store_1
+      CLUSTER_STORE_PEERS: Store_1:store_node_1:20001,Store_2:store_node_2:20002,Store_3:store_node_3:20003
+      NODE_PORT_1: 20001 # Portas explícitas para descoberta
+      NODE_PORT_2: 20002
+      NODE_PORT_3: 20003
+      PYTHONUNBUFFERED: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 20001)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+
+  store_node_2:
+    build: ./cluster_store_app
+    hostname: store_node_2
+    networks:
+      - my_distributed_net
+    ports:
+      - "20002:20002"
+    environment:
+      NODE_ID: Store_2
+      NODE_PORT: 20002
+      PRIMARY_NODE_ID: Store_1
+      CLUSTER_STORE_PEERS: Store_1:store_node_1:20001,Store_2:store_node_2:20002,Store_3:store_node_3:20003
+      NODE_PORT_1: 20001
+      NODE_PORT_2: 20002
+      NODE_PORT_3: 20003
+      PYTHONUNBUFFERED: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 20002)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  store_node_3:
+    build: ./cluster_store_app
+    hostname: store_node_3
+    networks:
+      - my_distributed_net
+    ports:
+      - "20003:20003"
+    environment:
+      NODE_ID: Store_3
+      NODE_PORT: 20003
+      PRIMARY_NODE_ID: Store_1
+      CLUSTER_STORE_PEERS: Store_1:store_node_1:20001,Store_2:store_node_2:20002,Store_3:store_node_3:20003
+      NODE_PORT_1: 20001
+      NODE_PORT_2: 20002
+      NODE_PORT_3: 20003
+      PYTHONUNBUFFERED: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 20003)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
   # --- Serviços do Cluster Sync ---
   sync_peer_1:
     build: ./cluster_sync_app # Usando a imagem do Cluster Sync
@@ -9,6 +83,7 @@ services:
       PEER_ID: Peer_1 # ID do peer
       PEER_PORT: 12345 # Porta do peer
       PYTHONUNBUFFERED: 1 # Variável de ambiente para garantir que a saída do Python seja exibida em tempo real
+      CLUSTER_STORE_PEERS: store_node_1:20001,store_node_2:20002,store_node_3:20003 # <-- NOVA VAR
 
     ports:
       - "12345:12345" # Mapeando a porta do peer para a porta do host
@@ -21,6 +96,13 @@ services:
       timeout: 3s # Tempo limite para o teste de saúde
       retries: 5 # Número de tentativas antes de considerar o serviço como não saudável
       start_period: 20s # Período de espera antes de iniciar o teste de saúde
+    depends_on: 
+      store_node_1:
+        condition: service_healthy
+      store_node_2:
+        condition: service_healthy
+      store_node_3:
+        condition: service_healthy
 
   sync_peer_2:
     build: ./cluster_sync_app
@@ -29,6 +111,7 @@ services:
       PEER_ID: Peer_2
       PEER_PORT: 12346
       PYTHONUNBUFFERED: 1
+      CLUSTER_STORE_PEERS: store_node_1:20001,store_node_2:20002,store_node_3:20003
     ports:
       - "12346:12346"
     networks:
@@ -40,8 +123,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 20s
-    depends_on:
-      sync_peer_1:
+    depends_on: 
+      store_node_1:
+        condition: service_healthy
+      store_node_2:
+        condition: service_healthy
+      store_node_3:
         condition: service_healthy
 
   sync_peer_3:
@@ -51,6 +138,7 @@ services:
       PEER_ID: Peer_3
       PEER_PORT: 12347
       PYTHONUNBUFFERED: 1
+      CLUSTER_STORE_PEERS: store_node_1:20001,store_node_2:20002,store_node_3:20003
     ports:
       - "12347:12347"
     networks:
@@ -62,10 +150,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 20s
-    depends_on:
-      sync_peer_1:
+    depends_on: 
+      store_node_1:
         condition: service_healthy
-      sync_peer_2:
+      store_node_2:
+        condition: service_healthy
+      store_node_3:
         condition: service_healthy
 
   sync_peer_4:
@@ -75,6 +165,7 @@ services:
       PEER_ID: Peer_4
       PEER_PORT: 12348
       PYTHONUNBUFFERED: 1
+      CLUSTER_STORE_PEERS: store_node_1:20001,store_node_2:20002,store_node_3:20003
     ports:
       - "12348:12348"
     networks:
@@ -86,12 +177,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 20s
-    depends_on:
-      sync_peer_1:
+    depends_on: 
+      store_node_1:
         condition: service_healthy
-      sync_peer_2:
+      store_node_2:
         condition: service_healthy
-      sync_peer_3:
+      store_node_3:
         condition: service_healthy
 
   sync_peer_5:
@@ -101,6 +192,7 @@ services:
       PEER_ID: Peer_5
       PEER_PORT: 12349
       PYTHONUNBUFFERED: 1
+      CLUSTER_STORE_PEERS: store_node_1:20001,store_node_2:20002,store_node_3:20003
     ports:
       - "12349:12349"
     networks:
@@ -112,14 +204,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 20s
-    depends_on:
-      sync_peer_1:
+    depends_on: 
+      store_node_1:
         condition: service_healthy
-      sync_peer_2:
+      store_node_2:
         condition: service_healthy
-      sync_peer_3:
-        condition: service_healthy
-      sync_peer_4:
+      store_node_3:
         condition: service_healthy
 
   # --- Serviços do Cliente ---
